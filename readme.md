@@ -54,7 +54,7 @@ Ares drops text-based communication (like `SET Key Value`) in favor of a strict 
 Requires a C++17 compatible compiler (`clang++` or `g++`).
 
 ```bash
-git clone [https://github.com/yourusername/project-ares.git](https://github.com/yourusername/project-ares.git)
+git clone [https://github.com/Saksham-596/project-ares.git](https://github.com/Saksham-596/project-ares.git)
 cd project-ares
 ```
 ## 2. Run the Engine
