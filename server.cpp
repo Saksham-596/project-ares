@@ -12,6 +12,8 @@
 #include<condition_variable>
 #include <cstring>      // Required for std::memcpy
 #include <arpa/inet.h>  // Required for ntohl()
+#include<atomic>
+#include<csignal>
 
 // THE sharded database to solve the lock contention problem by db_mutex
 const int NUM_SHARDS = 16;
@@ -27,18 +29,25 @@ std::queue<int> task_queue;
 std::mutex queue_mutex;
 std::condition_variable cv;
 
+std::atomic<bool> keep_running{true};
+
+void signal_handler(int signum) {
+    std::cout << "\n[Server] SIGINT received. Initiating graceful shutdown..." << std::endl;
+    keep_running = false;
+    cv.notify_all(); // This is theline that wakes up sleeping workers
+}
+
 void worker_thread(int worker_id) {
     std::cout << "[Worker " << worker_id << "] Online and standing by." << std::endl;
-    while(true) {
+    while(keep_running) {
         int client_socket;
         {
-            // wait for ticket 
             std::unique_lock<std::mutex> lock(queue_mutex);
-            cv.wait(lock,[]{ return !task_queue.empty();});
+            cv.wait(lock ,[]{return !task_queue.empty() || !keep_running ;});
+            if(!keep_running && task_queue.empty()) break;
             client_socket = task_queue.front();
             task_queue.pop();
         }
-        
         // 30 second time out 
         struct timeval tv ;
         tv.tv_sec = 30;
@@ -109,10 +118,14 @@ void worker_thread(int worker_id) {
 }
 
 void memory_sweeper(){
-     while(true) { 
-        // sleep for 10 seconds;
-        std::this_thread::sleep_for(std::chrono::seconds(10));
-        // loop all 16 shards and wipe them 
+     while(keep_running) { 
+        // small sleep intervals so it can detect keep_running changes faster
+        for(int s = 0 ;s < 10 && keep_running ;s++) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        if(!keep_running) {
+            break;
+        }
         for(int i = 0;i<NUM_SHARDS;i++) {
             std::lock_guard<std::mutex> lock(database_shards[i].lock);
             if(!database_shards[i].map.empty()) {
@@ -124,6 +137,7 @@ void memory_sweeper(){
 }
 
 int main(){
+    std::signal(SIGINT, signal_handler);
     int server_fd = socket(AF_INET,SOCK_STREAM,0);
     struct sockaddr_in address;
     address.sin_family = AF_INET;
@@ -132,22 +146,43 @@ int main(){
     bind(server_fd,(struct sockaddr*)&address , sizeof(address));
     listen(server_fd,1000);
     std::cout << "Project Ares Engine Online , 4 Worker threads are deployed" << std::endl;
+
     // spin up the thread pool
     std::thread sweeper(memory_sweeper);
-        sweeper.detach();
+
+    std::vector<std::thread> workers;
     for(int i = 0;i<4;i++) {
-        std::thread worker(worker_thread,i);
-        worker.detach();
+        workers.emplace_back(worker_thread,i);
     }
-    // Main thread takes the request
-    while(true) {
-        int client_socket = accept(server_fd,nullptr,nullptr);
-        {
-            std::lock_guard<std::mutex> lock(queue_mutex);
+
+    // main thread takes the request
+
+    while(keep_running) {
+         int client_socket = accept(server_fd,nullptr,nullptr);
+         // if accept is interrupted by SIGINT ,client_socket will be less than zero 
+         if(client_socket < 0 ) {
+            if(!keep_running) break;
+            continue;
+         }
+
+         {
+            std::lock_guard<std::mutex>  lock(queue_mutex);
             task_queue.push(client_socket);
-        }
-        // notify exactly one sleeping thread to handle it 
-        cv.notify_one(); 
+         }
+         cv.notify_one();
     }
+    // stop accepting new connections 
+    close(server_fd);
+    std::cout << "\n[server] joining thread pool ... " << std::endl;
+
+    if(sweeper.joinable()) {
+        sweeper.join();
+    } 
+    for(auto& worker : workers) {
+        if(worker.joinable()) {
+            worker.join();
+        }
+    }
+    std::cout <<"[Server] engine offline. All memory released safely" << std::endl;
     return 0;
 }
