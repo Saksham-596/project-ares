@@ -1,7 +1,7 @@
 #include<iostream>
-#include<sys/socket.h> // it will open the port or socket
-#include<netinet/in.h> // header of IP address
-#include<unistd.h> // header to close the port or socket
+#include<sys/socket.h>
+#include<netinet/in.h>
+#include<unistd.h>
 #include<unordered_map>
 #include<sstream>
 #include<thread>
@@ -10,106 +10,153 @@
 #include<vector>
 #include<queue>
 #include<condition_variable>
-#include <cstring>      // Required for std::memcpy
-#include <arpa/inet.h>  // Required for ntohl()
+#include<cstring>
+#include<arpa/inet.h>
 #include<atomic>
 #include<csignal>
 
-// THE sharded database to solve the lock contention problem by db_mutex
+// memory architecture
 const int NUM_SHARDS = 16;
-struct Shard {
-    std::unordered_map<std::string,std::string> map;
-    std::mutex lock;
+
+// doubly linked list
+struct Node {
+    std::string key , value;
+    Node* prev ;
+    Node* next ;
+    Node(std::string k , std::string v) : key(k) , value(v) , prev(nullptr) , next(nullptr) {}
 };
 
-// array of 16 independent shards 
-std::vector<Shard> database_shards(NUM_SHARDS);
-// sweeper thread logic
+// The LRU shard
+struct Shard {
+    int capacity = 10000 ; // 10k per shard , total 160k capacity
+    std::unordered_map<std::string ,Node*> map;
+    Node* head; // MRU ( most recently used)
+    Node* tail; // LRU (least recently used)
+    std::mutex lock;
+    Shard() {
+        // dummy head and tail to prevent accessing nullptr
+        head = new Node("","");
+        tail = new Node("","");
+        head->next = tail;
+        tail->next = head;
+    }
+    // Helper : snip node out of the list
+    void removeNode(Node * node) {
+        node->prev->next = node->next;
+        node->next->prev = node->prev;
+    }
+    // Helper : Attach node at the right behind the Head (MRU)
+    void addHead(Node * node) {
+        node->next = head->next;
+        node->prev = head;
+        head->next->prev  = node;
+        head->next = node;
+    }
+};
+// array of 16 independent LRU shards
+
+std::vector<Shard> database_shard(NUM_SHARDS);
+
+// thread pool state
 std::queue<int> task_queue;
 std::mutex queue_mutex;
 std::condition_variable cv;
 
+// shutdown architecture
 std::atomic<bool> keep_running{true};
+int server_fd = -1;
 
 void signal_handler(int signum) {
-    std::cout << "\n[Server] SIGINT received. Initiating graceful shutdown..." << std::endl;
+    std::cout << "\n[Server] SIGINT recieved , intializing shutdown ... " << std::endl;
     keep_running = false;
-    cv.notify_all(); // This is theline that wakes up sleeping workers
+    if(server_fd>=0){
+        shutdown(server_fd,SHUT_RDWR);
+    }
+    cv.notify_all(); // wake up all sleeping worker thread instantly
 }
 
 void worker_thread(int worker_id) {
-    std::cout << "[Worker " << worker_id << "] Online and standing by." << std::endl;
+    std::cout << "[Worker " << worker_id << "] online and standing by..." << std::endl;
+    
     while(keep_running) {
         int client_socket;
         {
             std::unique_lock<std::mutex> lock(queue_mutex);
-            cv.wait(lock ,[]{return !task_queue.empty() || !keep_running ;});
-            if(!keep_running && task_queue.empty()) break;
+            cv.wait(lock,[]{return!task_queue.empty() || !keep_running;});
+            if(!keep_running && task_queue.empty()) {
+                break;
+            }
             client_socket = task_queue.front();
             task_queue.pop();
         }
-        // 30 second time out 
-        struct timeval tv ;
+        struct timeval tv;
         tv.tv_sec = 30;
         tv.tv_usec = 0;
-        setsockopt(client_socket,SOL_SOCKET , SO_RCVTIMEO, (const char *)&tv , sizeof(tv));
-        // fixes TCP fragmentation 
+        setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO,(const char*)&tv ,sizeof(tv));
+        
         std::vector<uint8_t> buffer;
         while(true) {
             char temp_buffer[1024] = {0};
-            ssize_t byte_read = read(client_socket, temp_buffer,1024);
-            if(byte_read <= 0) { // client disconnected or timeout
-                break;
-            }
-            // append incoming data to accumulator -> buffer 
-            buffer.insert(buffer.end(),temp_buffer, temp_buffer+byte_read);
-            // process everything now 
-            while (buffer.size() >= 9) { // 9 byte is the minimum size of header
-                // read the header 
+            ssize_t byte_read  = read(client_socket,temp_buffer,1024);
+            if(byte_read <=0)break;
+            buffer.insert(buffer.end(),temp_buffer,temp_buffer+byte_read);
+            
+            while(buffer.size()>=9) {
                 uint8_t opcode = buffer[0];
-                // Read key length ,  network byte order to host byte order
+                
                 uint32_t val_len , key_len;
-                std::memcpy (&key_len,buffer.data() + 1, 4);
+                std::memcpy(&key_len,buffer.data() + 1 , 4) ;
                 key_len = ntohl(key_len);
-                // read value length
-                std::memcpy (&val_len,buffer.data() + 5 , 4);
+                std::memcpy(&val_len , buffer.data() + 5 , 4) ;
                 val_len = ntohl(val_len);
-                // calculate the exact size of this specific command
+                
                 uint32_t total_frame_size = 9 + key_len + val_len;
-                // if TCP chopped the packet and we don't have the full frame yet 
-                // break it and wait for more data.
-                if(buffer.size() < total_frame_size) {
-                    break;
-                }
-                //Extract Data 
+                if(buffer.size() < total_frame_size) break;
                 std::string key((char*)buffer.data() + 9 , key_len);
                 std::string value((char*)buffer.data() + 9 + key_len,val_len);
-                // Erase this frame from the buffer so we can process the next one 
-                buffer.erase(buffer.begin() , buffer.begin() + total_frame_size);
-                // Sharded database Execution 
+                buffer.erase(buffer.begin(), buffer.begin() + total_frame_size);
+                
                 size_t shard_index = std::hash<std::string>{}(key)%NUM_SHARDS;
                 const char* response = "ERR\n";
-                int response_len = 4;
+                int response_len = 4 ;
                 {
-                    std::lock_guard<std::mutex> db_lock(database_shards[shard_index].lock);
-
-                    if(opcode == 0x01) { // SET command 
-                        database_shards[shard_index].map[key] = value;
+                    std::lock_guard<std::mutex> db_lock(database_shard[shard_index].lock);
+                    Shard& shard = database_shard[shard_index];
+                    
+                    
+                    if(opcode == 0x01){// setcommand;
+                        if(shard.map.count(key)>0) {
+                            Node * node = shard.map[key];
+                            node->value = value;
+                            shard.removeNode(node);
+                            shard.addHead(node);
+                        }else {
+                            Node * newNode = new Node(key,value);
+                            shard.map[key] = newNode;
+                            shard.addHead(newNode);
+                            // evict the LRU element if over capacity
+                            if(shard.map.size() > shard.capacity) {
+                                Node* lru = shard.tail->prev;
+                                shard.removeNode(lru);
+                                shard.map.erase(lru->key);
+                                delete lru;
+                            }
+                        }
                         response = "OK\n";
                         response_len = 3;
                     }else if(opcode == 0x02) { // GET command
-                        if(database_shards[shard_index].map.count(key) > 0) {
+                        if(shard.map.count(key) > 0 ){
+                            Node * node = shard.map[key];
+                            shard.removeNode(node);
+                            shard.addHead(node);
                             response = "OK\n";
-                            response_len =3;
-                        }else {
+                            response_len = 3;
+                        }else{
                             response = "nil\n";
                             response_len = 4;
-
                         }
-
                     }
-                } // mutex unlocks here 
-                // send response 
+                }
                 send(client_socket,response,response_len,0);
             }
         }
@@ -117,72 +164,137 @@ void worker_thread(int worker_id) {
     }
 }
 
-void memory_sweeper(){
-     while(keep_running) { 
-        // small sleep intervals so it can detect keep_running changes faster
-        for(int s = 0 ;s < 10 && keep_running ;s++) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-        }
-        if(!keep_running) {
-            break;
-        }
-        for(int i = 0;i<NUM_SHARDS;i++) {
-            std::lock_guard<std::mutex> lock(database_shards[i].lock);
-            if(!database_shards[i].map.empty()) {
-                database_shards[i].map.clear();
-            }
-        }
-        std::cout << "\n[Sweeper] all 16 shards are cleaned." << std::endl;
-     }
-}
-
-int main(){
-    std::signal(SIGINT, signal_handler);
-    int server_fd = socket(AF_INET,SOCK_STREAM,0);
-    struct sockaddr_in address;
+int main() {
+    // Arm the kill switch
+    std::signal(SIGINT,signal_handler);
+    // Arm the kill switch with strict POSIX sigaction
+    struct sigaction sa;
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0; // The magic line: 0 explicitly disables SA_RESTART
+    sigaction(SIGINT, &sa, nullptr);
+    
+    // open the tcp socket
+    server_fd = socket(AF_INET , SOCK_STREAM,0);
+    if(server_fd < 0 ) {
+        std::cerr << "[Fatal error] failed to create socket" << std::endl;
+        return 1;
+    }
+    // set SO_REUSEADDR to prevent "port already in use" error if restarted quickly
+    int opt = 1 ;
+    setsockopt(server_fd , SOL_SOCKET,SO_REUSEADDR,&opt,sizeof(opt));
+    
+    struct sockaddr_in  address;
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(8080);
-    bind(server_fd,(struct sockaddr*)&address , sizeof(address));
+    if(bind(server_fd ,(struct sockaddr*)&address,sizeof(address))<0) {
+        std::cerr <<"[Fatal error] Failed to bind to port 8080." << std::endl;
+        return 1;
+    }
     listen(server_fd,1000);
-    std::cout << "Project Ares Engine Online , 4 Worker threads are deployed" << std::endl;
-
-    // spin up the thread pool
-    std::thread sweeper(memory_sweeper);
-
+    std::cout << "Project Ares engine online... port: 8000" << std::endl;
+    std::cout << "Architecture: 16-way LRU cache. capacity 160k keys." << std::endl;
+    // Deploy threads
     std::vector<std::thread> workers;
     for(int i = 0;i<4;i++) {
         workers.emplace_back(worker_thread,i);
     }
-
-    // main thread takes the request
-
     while(keep_running) {
-         int client_socket = accept(server_fd,nullptr,nullptr);
-         // if accept is interrupted by SIGINT ,client_socket will be less than zero 
-         if(client_socket < 0 ) {
-            if(!keep_running) break;
+        int client_socket = accept(server_fd, nullptr,nullptr);
+        // if accept is interrupted by SIGINT singnal
+        if(client_socket < 0 ) {
+            if(!keep_running)break;
             continue;
-         }
-
-         {
-            std::lock_guard<std::mutex>  lock(queue_mutex);
+        }
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex);
             task_queue.push(client_socket);
-         }
-         cv.notify_one();
+        }
+        cv.notify_one();
     }
-    // stop accepting new connections 
+    // clean up
+    std::cout << "\n[Server] sealing port 8080..." <<std::endl;
     close(server_fd);
-    std::cout << "\n[server] joining thread pool ... " << std::endl;
-
-    if(sweeper.joinable()) {
-        sweeper.join();
-    } 
-    for(auto& worker : workers) {
+    std::cout << "\n[Server] Awaiting thread pool convergence..." << std::endl;
+    for(auto & worker : workers) {
         if(worker.joinable()) {
             worker.join();
         }
     }
-    std::cout <<"[Server] engine offline. All memory released safely" << std::endl;
+    std:: cout << "[Server] Engine offline. All memory released safely. " << std::endl;
     return 0;
 }
+
+/*
+Pre-computing 200000 unique binary payloads...
+This guarantees Python is not the bottleneck. Stand by...
+Payloads loaded. Engaging Project Ares Engine...
+--------------------------------------------------
+Chaos Benchmark Complete in 1.7045 seconds.
+Total Unique Keys Injected: 200000
+True Production Throughput: 117336.81 Requests/Second.
+--------------------------------------------------
+sakshampal@SAKSHAMS-M5 project-ares % python3 benchmark.py
+Pre-computing 200000 unique binary payloads...
+This guarantees Python is not the bottleneck. Stand by...
+Payloads loaded. Engaging Project Ares Engine...
+--------------------------------------------------
+Chaos Benchmark Complete in 1.7538 seconds.
+Total Unique Keys Injected: 200000
+True Production Throughput: 114035.88 Requests/Second.
+--------------------------------------------------
+sakshampal@SAKSHAMS-M5 project-ares % python3 benchmark.py
+Pre-computing 200000 unique binary payloads...
+This guarantees Python is not the bottleneck. Stand by...
+Payloads loaded. Engaging Project Ares Engine...
+--------------------------------------------------
+Chaos Benchmark Complete in 1.7542 seconds.
+Total Unique Keys Injected: 200000
+True Production Throughput: 114011.17 Requests/Second.
+--------------------------------------------------
+sakshampal@SAKSHAMS-M5 project-ares % python3 benchmark.py
+Pre-computing 200000 unique binary payloads...
+This guarantees Python is not the bottleneck. Stand by...
+Payloads loaded. Engaging Project Ares Engine...
+--------------------------------------------------
+Chaos Benchmark Complete in 1.7255 seconds.
+Total Unique Keys Injected: 200000
+True Production Throughput: 115909.71 Requests/Second.
+--------------------------------------------------
+sakshampal@SAKSHAMS-M5 project-ares % python3 benchmark.py
+Pre-computing 200000 unique binary payloads...
+This guarantees Python is not the bottleneck. Stand by...
+Payloads loaded. Engaging Project Ares Engine...
+--------------------------------------------------
+Chaos Benchmark Complete in 1.7338 seconds.
+Total Unique Keys Injected: 200000
+True Production Throughput: 115352.31 Requests/Second.
+--------------------------------------------------
+sakshampal@SAKSHAMS-M5 project-ares % python3 benchmark.py
+Pre-computing 200000 unique binary payloads...
+This guarantees Python is not the bottleneck. Stand by...
+Payloads loaded. Engaging Project Ares Engine...
+--------------------------------------------------
+Chaos Benchmark Complete in 1.7470 seconds.
+Total Unique Keys Injected: 200000
+True Production Throughput: 114480.53 Requests/Second.
+--------------------------------------------------
+sakshampal@SAKSHAMS-M5 project-ares % python3 benchmark.py
+Pre-computing 200000 unique binary payloads...
+This guarantees Python is not the bottleneck. Stand by...
+Payloads loaded. Engaging Project Ares Engine...
+--------------------------------------------------
+Chaos Benchmark Complete in 1.7349 seconds.
+Total Unique Keys Injected: 200000
+True Production Throughput: 115279.44 Requests/Second.
+--------------------------------------------------
+sakshampal@SAKSHAMS-M5 project-ares % python3 benchmark.py
+Pre-computing 200000 unique binary payloads...
+This guarantees Python is not the bottleneck. Stand by...
+Payloads loaded. Engaging Project Ares Engine...
+--------------------------------------------------
+Chaos Benchmark Complete in 1.7463 seconds.
+Total Unique Keys Injected: 200000
+True Production Throughput: 114527.13 Requests/Second.
+--------------------------------------------------*/
