@@ -1,4 +1,3 @@
-# script given by chatGPT
 import socket
 import time
 import threading
