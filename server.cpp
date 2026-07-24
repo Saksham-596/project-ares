@@ -197,7 +197,7 @@ int main() {
     std::cout << "Architecture: 16-way LRU cache. capacity 160k keys." << std::endl;
     // Deploy threads
     std::vector<std::thread> workers;
-    for(int i = 0;i<4;i++) {
+    for(int i = 0;i<3;i++) {
         workers.emplace_back(worker_thread,i);
     }
     while(keep_running) {
@@ -297,4 +297,52 @@ Payloads loaded. Engaging Project Ares Engine...
 Chaos Benchmark Complete in 1.7463 seconds.
 Total Unique Keys Injected: 200000
 True Production Throughput: 114527.13 Requests/Second.
---------------------------------------------------*/
+----------------------------------------------------------------------------------------------------
+Chaos Benchmark Complete in 1.6033 seconds.
+Total Unique Keys Injected: 200000
+True Production Throughput: 124743.90 Requests/Second.
+--------------------------------------------------
+sakshampal@SAKSHAMS-M5 project-ares % python3 benchmark.py
+Pre-computing 200000 unique binary payloads...
+This guarantees Python is not the bottleneck. Stand by...
+Payloads loaded. Engaging Project Ares Engine...
+--------------------------------------------------
+Chaos Benchmark Complete in 1.5822 seconds.
+Total Unique Keys Injected: 200000
+True Production Throughput: 126409.94 Requests/Second.
+--------------------------------------------------
+sakshampal@SAKSHAMS-M5 project-ares % python3 benchmark.py
+Pre-computing 200000 unique binary payloads...
+This guarantees Python is not the bottleneck. Stand by...
+Payloads loaded. Engaging Project Ares Engine...
+--------------------------------------------------
+Chaos Benchmark Complete in 1.5846 seconds.
+Total Unique Keys Injected: 200000
+True Production Throughput: 126214.19 Requests/Second.
+--------------------------------------------------
+sakshampal@SAKSHAMS-M5 project-ares % python3 benchmark.py
+Pre-computing 200000 unique binary payloads...
+This guarantees Python is not the bottleneck. Stand by...
+Payloads loaded. Engaging Project Ares Engine...
+--------------------------------------------------
+Chaos Benchmark Complete in 1.5763 seconds.
+Total Unique Keys Injected: 200000
+True Production Throughput: 126879.91 Requests/Second.
+--------------------------------------------------
+sakshampal@SAKSHAMS-M5 project-ares % python3 benchmark.py
+Pre-computing 200000 unique binary payloads...
+This guarantees Python is not the bottleneck. Stand by...
+Payloads loaded. Engaging Project Ares Engine...
+--------------------------------------------------
+Chaos Benchmark Complete in 1.5989 seconds.
+Total Unique Keys Injected: 200000
+True Production Throughput: 125085.36 Requests/Second.
+--------------------------------------------------
+sakshampal@SAKSHAMS-M5 project-ares % python3 benchmark.py
+Pre-computing 200000 unique binary payloads...
+This guarantees Python is not the bottleneck. Stand by...
+Payloads loaded. Engaging Project Ares Engine...
+--------------------------------------------------
+Chaos Benchmark Complete in 1.5763 seconds.
+Total Unique Keys Injected: 200000
+True Production Throughput: 126882.06 Requests/Second.*/
