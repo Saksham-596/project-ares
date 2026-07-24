@@ -38,7 +38,7 @@ struct Shard {
         head = new Node("","");
         tail = new Node("","");
         head->next = tail;
-        tail->next = head;
+        tail->prev = head;
     }
     // Helper : snip node out of the list
     void removeNode(Node * node) {
