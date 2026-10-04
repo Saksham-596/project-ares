@@ -1,13 +1,16 @@
 #include <iostream>
+
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
+
 #include <unordered_map>
 #include <thread>
 #include <mutex>
 #include <vector>
 #include <queue>
 #include <condition_variable>
+
 #include <cstring>
 #include <arpa/inet.h>
 #include <atomic>
@@ -15,6 +18,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <string>
+#include <utility>
 
 // ==================================================
 // CONFIGURATION
@@ -31,12 +35,14 @@ constexpr int RECEIVE_TIMEOUT_SECONDS = 30;
 
 constexpr std::size_t FRAME_HEADER_SIZE = 9;
 
-// Maximum complete request frame.
-// Prevents a client from forcing unbounded buffering/allocation.
-constexpr std::size_t MAX_FRAME_SIZE = 1024 * 1024; // 1 MiB
+constexpr std::size_t MAX_FRAME_SIZE = 1024 * 1024;
+
+// Compact the stream buffer after enough bytes have
+// been consumed rather than erasing after every frame.
+constexpr std::size_t COMPACT_THRESHOLD = 4096;
 
 // ==================================================
-// SIGNAL / SHUTDOWN STATE
+// SIGNAL / SHUTDOWN
 // ==================================================
 
 volatile std::sig_atomic_t shutdown_requested = 0;
@@ -44,16 +50,6 @@ volatile std::sig_atomic_t shutdown_requested = 0;
 std::atomic<bool> keep_running{true};
 
 int server_fd = -1;
-
-// Signal handler performs only signal-safe work.
-//
-// We deliberately do not:
-// - print
-// - lock mutexes
-// - allocate memory
-// - access STL containers
-//
-// shutdown() is used to interrupt accept().
 
 void signal_handler(int)
 {
@@ -68,26 +64,42 @@ void signal_handler(int)
 // ==================================================
 // LRU NODE
 // ==================================================
+//
+// V1 stored:
+//
+//     key
+//     value
+//
+// while unordered_map also stored:
+//
+//     key
+//
+// V2 lets unordered_map own the key.
+//
+// key_ref points into the unordered_map key.
+//
+// It is valid while the corresponding map element exists.
+// unordered_map rehash does not invalidate references/pointers
+// to elements; erasing the element does.
+// ==================================================
 
 struct Node
 {
-    std::string key;
     std::string value;
 
-    Node *prev;
-    Node *next;
+    const std::string *key_ref = nullptr;
 
-    Node(std::string k, std::string v)
-        : key(std::move(k)),
-          value(std::move(v)),
-          prev(nullptr),
-          next(nullptr)
+    Node *prev = nullptr;
+    Node *next = nullptr;
+
+    explicit Node(std::string v)
+        : value(std::move(v))
     {
     }
 };
 
 // ==================================================
-// LRU SHARD
+// SHARD
 // ==================================================
 
 struct Shard
@@ -96,11 +108,6 @@ struct Shard
 
     std::unordered_map<std::string, Node *> map;
 
-    // head = MRU sentinel
-    // tail = LRU sentinel
-    //
-    // head <-> MRU ... LRU <-> tail
-
     Node *head;
     Node *tail;
 
@@ -108,19 +115,20 @@ struct Shard
 
     Shard()
     {
-        head = new Node("", "");
-        tail = new Node("", "");
+        // Reserve capacity + 1 so insertion of the new
+        // entry before eviction does not immediately force
+        // a rehash.
+        map.reserve(SHARD_CAPACITY + 1);
+
+        head = new Node("");
+        tail = new Node("");
 
         head->next = tail;
-        head->prev = nullptr;
-
         tail->prev = head;
-        tail->next = nullptr;
     }
 
     ~Shard()
     {
-        // map owns all real nodes.
         for (auto &entry : map)
         {
             delete entry.second;
@@ -133,14 +141,12 @@ struct Shard
     Shard(const Shard &) = delete;
     Shard &operator=(const Shard &) = delete;
 
-    // Remove node from current position.
     void removeNode(Node *node)
     {
         node->prev->next = node->next;
         node->next->prev = node->prev;
     }
 
-    // Insert node immediately after head = MRU.
     void addHead(Node *node)
     {
         node->next = head->next;
@@ -148,6 +154,23 @@ struct Shard
 
         head->next->prev = node;
         head->next = node;
+    }
+
+    void evictLRU()
+    {
+        Node *lru = tail->prev;
+
+        if (lru == head)
+        {
+            return;
+        }
+
+        removeNode(lru);
+
+        // key_ref remains valid until erase.
+        map.erase(*lru->key_ref);
+
+        delete lru;
     }
 };
 
@@ -167,15 +190,8 @@ std::mutex queue_mutex;
 std::condition_variable cv;
 
 // ==================================================
-// SEND ALL
+// RESPONSE HELPERS
 // ==================================================
-//
-// TCP send() is allowed to perform a partial write.
-// Keep sending until the complete response is transmitted.
-//
-// MSG_NOSIGNAL prevents a broken client connection from
-// terminating the process with SIGPIPE on Linux/macOS.
-//
 
 bool send_all(
     int socket_fd,
@@ -186,15 +202,18 @@ bool send_all(
 
     while (total_sent < length)
     {
-        ssize_t sent = send(
-            socket_fd,
-            data + total_sent,
-            length - total_sent,
-            MSG_NOSIGNAL);
+        ssize_t sent =
+            send(
+                socket_fd,
+                data + total_sent,
+                length - total_sent,
+                MSG_NOSIGNAL);
 
         if (sent > 0)
         {
-            total_sent += static_cast<std::size_t>(sent);
+            total_sent +=
+                static_cast<std::size_t>(sent);
+
             continue;
         }
 
@@ -209,54 +228,49 @@ bool send_all(
     return true;
 }
 
+bool send_error(int fd)
+{
+    static constexpr char response[] = "ERR\n";
+
+    return send_all(
+        fd,
+        response,
+        sizeof(response) - 1);
+}
+
 // ==================================================
-// PROCESS ONE COMPLETE FRAME
+// PROCESS FRAME
 // ==================================================
-//
-// Protocol:
-//
-// byte 0      : opcode
-// bytes 1-4   : key length, network byte order
-// bytes 5-8   : value length, network byte order
-// bytes 9...  : key + value
-//
-// V1 intentionally keeps the original response semantics:
-//
-// SET success -> OK\n
-// GET hit     -> OK\n
-// GET miss    -> nil\n
-// invalid     -> ERR\n
-//
 
 bool process_frame(
     int client_socket,
-    const std::vector<std::uint8_t> &buffer,
+    const std::uint8_t *frame,
     std::size_t frame_size)
 {
     if (frame_size < FRAME_HEADER_SIZE ||
         frame_size > MAX_FRAME_SIZE)
     {
-        const char response[] = "ERR\n";
-
-        return send_all(
-            client_socket,
-            response,
-            sizeof(response) - 1);
+        return send_error(client_socket);
     }
 
-    const std::uint8_t opcode = buffer[0];
+    const std::uint8_t opcode = frame[0];
+
+    if (opcode != 0x01 && opcode != 0x02)
+    {
+        return send_error(client_socket);
+    }
 
     std::uint32_t key_len_network = 0;
     std::uint32_t value_len_network = 0;
 
     std::memcpy(
         &key_len_network,
-        buffer.data() + 1,
+        frame + 1,
         sizeof(key_len_network));
 
     std::memcpy(
         &value_len_network,
-        buffer.data() + 5,
+        frame + 5,
         sizeof(value_len_network));
 
     const std::size_t key_len =
@@ -265,171 +279,169 @@ bool process_frame(
     const std::size_t value_len =
         ntohl(value_len_network);
 
-    // The parser already performs these checks.
-    // Keep them here as a defensive invariant.
-    if (key_len + value_len >
+    // Overflow-safe validation.
+    if (key_len >
         MAX_FRAME_SIZE - FRAME_HEADER_SIZE)
     {
-        const char response[] = "ERR\n";
-
-        return send_all(
-            client_socket,
-            response,
-            sizeof(response) - 1);
-    }
-
-    if (key_len >
-        frame_size - FRAME_HEADER_SIZE)
-    {
-        const char response[] = "ERR\n";
-
-        return send_all(
-            client_socket,
-            response,
-            sizeof(response) - 1);
+        return send_error(client_socket);
     }
 
     if (value_len >
-        frame_size - FRAME_HEADER_SIZE - key_len)
+        MAX_FRAME_SIZE -
+            FRAME_HEADER_SIZE -
+            key_len)
     {
-        const char response[] = "ERR\n";
-
-        return send_all(
-            client_socket,
-            response,
-            sizeof(response) - 1);
+        return send_error(client_socket);
     }
 
-    // Explicit opcode validation.
-    if (opcode != 0x01 && opcode != 0x02)
-    {
-        const char response[] = "ERR\n";
+    const std::size_t expected_frame_size =
+        FRAME_HEADER_SIZE +
+        key_len +
+        value_len;
 
-        return send_all(
-            client_socket,
-            response,
-            sizeof(response) - 1);
+    if (expected_frame_size != frame_size)
+    {
+        return send_error(client_socket);
     }
 
-    // Construct key only after validating its size.
-    std::string key(
-        reinterpret_cast<const char *>(
-            buffer.data() + FRAME_HEADER_SIZE),
-        key_len);
-
-    const std::size_t shard_index =
-        std::hash<std::string>{}(key) % NUM_SHARDS;
-
-    Shard &shard =
-        database_shard[shard_index];
-
-    const char *response = "ERR\n";
-    std::size_t response_len = 4;
-
+    try
     {
-        std::lock_guard<std::mutex> db_lock(
-            shard.lock);
+        std::string key(
+            reinterpret_cast<const char *>(
+                frame + FRAME_HEADER_SIZE),
+            key_len);
 
-        auto it = shard.map.find(key);
+        const std::size_t shard_index =
+            std::hash<std::string>{}(key) %
+            NUM_SHARDS;
 
-        // ==================================================
-        // SET
-        // ==================================================
+        Shard &shard =
+            database_shard[shard_index];
 
-        if (opcode == 0x01)
+        const char *response = "ERR\n";
+        std::size_t response_len = 4;
+
         {
-            std::string value(
-                reinterpret_cast<const char *>(
-                    buffer.data() +
-                    FRAME_HEADER_SIZE +
-                    key_len),
-                value_len);
+            std::lock_guard<std::mutex> db_lock(
+                shard.lock);
 
-            if (it != shard.map.end())
+            auto it = shard.map.find(key);
+
+            // ==================================================
+            // SET
+            // ==================================================
+
+            if (opcode == 0x01)
             {
-                // Existing key.
-                Node *node = it->second;
+                std::string value(
+                    reinterpret_cast<const char *>(
+                        frame +
+                        FRAME_HEADER_SIZE +
+                        key_len),
+                    value_len);
 
-                node->value = std::move(value);
-
-                shard.removeNode(node);
-                shard.addHead(node);
-            }
-            else
-            {
-                // New key.
-                Node *node =
-                    new Node(
-                        std::move(key),
-                        std::move(value));
-
-                try
+                if (it != shard.map.end())
                 {
-                    shard.map.emplace(
-                        node->key,
-                        node);
+                    Node *node = it->second;
+
+                    node->value =
+                        std::move(value);
+
+                    shard.removeNode(node);
+                    shard.addHead(node);
                 }
-                catch (...)
+                else
                 {
-                    delete node;
-                    throw;
+                    Node *node =
+                        new Node(
+                            std::move(value));
+
+                    try
+                    {
+                        auto result =
+                            shard.map.emplace(
+                                std::move(key),
+                                node);
+
+                        if (!result.second)
+                        {
+                            delete node;
+
+                            return send_error(
+                                client_socket);
+                        }
+
+                        auto map_it =
+                            result.first;
+
+                        node->key_ref =
+                            &map_it->first;
+
+                        shard.addHead(node);
+
+                        // New entry may temporarily make
+                        // the shard contain capacity + 1.
+                        if (shard.map.size() >
+                            shard.capacity)
+                        {
+                            shard.evictLRU();
+                        }
+                    }
+                    catch (...)
+                    {
+                        delete node;
+                        throw;
+                    }
                 }
-
-                shard.addHead(node);
-
-                // Evict LRU if capacity exceeded.
-                if (shard.map.size() >
-                    shard.capacity)
-                {
-                    Node *lru =
-                        shard.tail->prev;
-
-                    shard.removeNode(lru);
-
-                    shard.map.erase(lru->key);
-
-                    delete lru;
-                }
-            }
-
-            response = "OK\n";
-            response_len = 3;
-        }
-
-        // ==================================================
-        // GET
-        // ==================================================
-
-        else
-        {
-            if (it != shard.map.end())
-            {
-                Node *node = it->second;
-
-                // GET makes the item MRU.
-                shard.removeNode(node);
-                shard.addHead(node);
 
                 response = "OK\n";
                 response_len = 3;
             }
+
+            // ==================================================
+            // GET
+            // ==================================================
+
             else
             {
-                response = "nil\n";
-                response_len = 4;
+                if (it != shard.map.end())
+                {
+                    Node *node = it->second;
+
+                    // GET mutates LRU order.
+                    shard.removeNode(node);
+                    shard.addHead(node);
+
+                    response = "OK\n";
+                    response_len = 3;
+                }
+                else
+                {
+                    response = "nil\n";
+                    response_len = 4;
+                }
             }
         }
-    }
 
-    // Never hold the shard mutex while doing network I/O.
-    return send_all(
-        client_socket,
-        response,
-        response_len);
+        // Network I/O remains outside shard lock.
+        return send_all(
+            client_socket,
+            response,
+            response_len);
+    }
+    catch (const std::bad_alloc &)
+    {
+        // Keep worker alive under memory pressure.
+        return send_error(client_socket);
+    }
+    catch (...)
+    {
+        return send_error(client_socket);
+    }
 }
 
 // ==================================================
-// WORKER THREAD
+// WORKER
 // ==================================================
 
 void worker_thread(int worker_id)
@@ -442,10 +454,6 @@ void worker_thread(int worker_id)
     while (keep_running)
     {
         int client_socket = -1;
-
-        // --------------------------------------------------
-        // Obtain a client from the queue.
-        // --------------------------------------------------
 
         {
             std::unique_lock<std::mutex> lock(
@@ -465,8 +473,6 @@ void worker_thread(int worker_id)
                 break;
             }
 
-            // During shutdown, do not start processing
-            // newly queued work.
             if (!keep_running)
             {
                 break;
@@ -478,13 +484,15 @@ void worker_thread(int worker_id)
             task_queue.pop();
         }
 
-        // --------------------------------------------------
-        // Configure client socket.
-        // --------------------------------------------------
+        // ==================================================
+        // SOCKET CONFIGURATION
+        // ==================================================
 
         struct timeval tv{};
 
-        tv.tv_sec = RECEIVE_TIMEOUT_SECONDS;
+        tv.tv_sec =
+            RECEIVE_TIMEOUT_SECONDS;
+
         tv.tv_usec = 0;
 
         if (setsockopt(
@@ -503,15 +511,15 @@ void worker_thread(int worker_id)
             continue;
         }
 
-        // --------------------------------------------------
-        // TCP stream buffer.
-        //
-        // One read() does NOT necessarily equal one frame.
-        // --------------------------------------------------
+        // ==================================================
+        // STREAM BUFFER
+        // ==================================================
 
         std::vector<std::uint8_t> buffer;
 
         buffer.reserve(4096);
+
+        std::size_t read_offset = 0;
 
         bool client_ok = true;
 
@@ -537,8 +545,29 @@ void worker_thread(int worker_id)
                     static_cast<std::size_t>(
                         bytes_read);
 
-                // Never allow buffered data to exceed
-                // the maximum legal frame size.
+                // Compact only when needed.
+                if (read_offset > 0 &&
+                    (buffer.size() + bytes >
+                         MAX_FRAME_SIZE ||
+                     read_offset >=
+                         COMPACT_THRESHOLD))
+                {
+                    const std::size_t remaining =
+                        buffer.size() -
+                        read_offset;
+
+                    std::memmove(
+                        buffer.data(),
+                        buffer.data() + read_offset,
+                        remaining);
+
+                    buffer.resize(remaining);
+
+                    read_offset = 0;
+                }
+
+                // Ensure the buffered unread data cannot
+                // exceed the maximum legal frame size.
                 if (buffer.size() >
                         MAX_FRAME_SIZE ||
                     bytes >
@@ -549,6 +578,7 @@ void worker_thread(int worker_id)
                         << "[Warning] client exceeded "
                         << "maximum frame size\n";
 
+                    client_ok = false;
                     break;
                 }
 
@@ -558,29 +588,36 @@ void worker_thread(int worker_id)
                     temp_buffer + bytes);
 
                 // ==================================================
-                // PARSE COMPLETE FRAMES
+                // PARSE FRAMES
                 // ==================================================
 
                 while (true)
                 {
-                    // Not enough bytes for header.
-                    if (buffer.size() <
+                    const std::size_t available =
+                        buffer.size() -
+                        read_offset;
+
+                    if (available <
                         FRAME_HEADER_SIZE)
                     {
                         break;
                     }
+
+                    const std::uint8_t *frame =
+                        buffer.data() +
+                        read_offset;
 
                     std::uint32_t key_len_network = 0;
                     std::uint32_t value_len_network = 0;
 
                     std::memcpy(
                         &key_len_network,
-                        buffer.data() + 1,
+                        frame + 1,
                         sizeof(key_len_network));
 
                     std::memcpy(
                         &value_len_network,
-                        buffer.data() + 5,
+                        frame + 5,
                         sizeof(value_len_network));
 
                     const std::size_t key_len =
@@ -588,10 +625,6 @@ void worker_thread(int worker_id)
 
                     const std::size_t value_len =
                         ntohl(value_len_network);
-
-                    // --------------------------------------------------
-                    // Safe frame-size calculation.
-                    // --------------------------------------------------
 
                     if (key_len >
                             MAX_FRAME_SIZE -
@@ -608,46 +641,56 @@ void worker_thread(int worker_id)
                         break;
                     }
 
-                    const std::size_t total_frame_size =
+                    const std::size_t frame_size =
                         FRAME_HEADER_SIZE +
                         key_len +
                         value_len;
 
-                    // Incomplete frame.
-                    if (buffer.size() <
-                        total_frame_size)
+                    if (available < frame_size)
                     {
                         break;
                     }
 
-                    // --------------------------------------------------
-                    // Process complete frame.
-                    // --------------------------------------------------
-
                     if (!process_frame(
                             client_socket,
-                            buffer,
-                            total_frame_size))
+                            frame,
+                            frame_size))
                     {
                         client_ok = false;
                         break;
                     }
 
-                    // --------------------------------------------------
-                    // Consume exactly one frame.
-                    //
-                    // This preserves support for:
-                    //
-                    // [frame][frame][frame]
-                    //
-                    // in a single TCP read().
-                    // --------------------------------------------------
+                    read_offset += frame_size;
 
-                    buffer.erase(
-                        buffer.begin(),
-                        buffer.begin() +
-                            static_cast<std::ptrdiff_t>(
-                                total_frame_size));
+                    // All buffered data consumed.
+                    if (read_offset ==
+                        buffer.size())
+                    {
+                        buffer.clear();
+                        read_offset = 0;
+                        break;
+                    }
+
+                    // Avoid retaining a large consumed prefix.
+                    if (read_offset >=
+                            COMPACT_THRESHOLD &&
+                        read_offset * 2 >=
+                            buffer.size())
+                    {
+                        const std::size_t remaining =
+                            buffer.size() -
+                            read_offset;
+
+                        std::memmove(
+                            buffer.data(),
+                            buffer.data() +
+                                read_offset,
+                            remaining);
+
+                        buffer.resize(remaining);
+
+                        read_offset = 0;
+                    }
                 }
             }
 
@@ -661,7 +704,7 @@ void worker_thread(int worker_id)
             }
 
             // ==================================================
-            // READ ERROR
+            // ERROR
             // ==================================================
 
             else
@@ -671,7 +714,6 @@ void worker_thread(int worker_id)
                     continue;
                 }
 
-                // SO_RCVTIMEO timeout.
                 if (errno == EAGAIN ||
                     errno == EWOULDBLOCK)
                 {
@@ -702,18 +744,12 @@ void worker_thread(int worker_id)
 
 int main()
 {
-    // ==================================================
-    // SIGNAL SETUP
-    // ==================================================
-
     struct sigaction sa{};
 
     sa.sa_handler = signal_handler;
 
     sigemptyset(&sa.sa_mask);
 
-    // Do not use SA_RESTART.
-    // We want SIGINT to interrupt accept().
     sa.sa_flags = 0;
 
     if (sigaction(
@@ -728,10 +764,6 @@ int main()
 
         return 1;
     }
-
-    // ==================================================
-    // CREATE SERVER SOCKET
-    // ==================================================
 
     server_fd =
         socket(
@@ -748,10 +780,6 @@ int main()
 
         return 1;
     }
-
-    // ==================================================
-    // SO_REUSEADDR
-    // ==================================================
 
     int opt = 1;
 
@@ -773,10 +801,6 @@ int main()
         return 1;
     }
 
-    // ==================================================
-    // ADDRESS
-    // ==================================================
-
     sockaddr_in address{};
 
     address.sin_family =
@@ -787,10 +811,6 @@ int main()
 
     address.sin_port =
         htons(SERVER_PORT);
-
-    // ==================================================
-    // BIND
-    // ==================================================
 
     if (bind(
             server_fd,
@@ -809,10 +829,6 @@ int main()
         return 1;
     }
 
-    // ==================================================
-    // LISTEN
-    // ==================================================
-
     if (listen(
             server_fd,
             LISTEN_BACKLOG) < 0)
@@ -829,17 +845,13 @@ int main()
     }
 
     std::cout
-        << "Project Ares V1 online... port: "
+        << "Project Ares V2 online... port: "
         << SERVER_PORT
         << '\n';
 
     std::cout
         << "Architecture: 16-way LRU cache. "
         << "capacity 160k keys.\n";
-
-    // ==================================================
-    // START WORKERS
-    // ==================================================
 
     std::vector<std::thread> workers;
 
@@ -886,7 +898,7 @@ int main()
     }
 
     // ==================================================
-    // ACCEPT LOOP
+    // ACCEPT
     // ==================================================
 
     while (keep_running)
@@ -899,6 +911,12 @@ int main()
 
         if (client_socket >= 0)
         {
+            if (!keep_running)
+            {
+                close(client_socket);
+                break;
+            }
+
             {
                 std::lock_guard<std::mutex> lock(
                     queue_mutex);
@@ -912,7 +930,6 @@ int main()
             continue;
         }
 
-        // SIGINT interrupted accept().
         if (errno == EINTR)
         {
             if (shutdown_requested)
@@ -923,7 +940,6 @@ int main()
             continue;
         }
 
-        // Another error while shutting down.
         if (shutdown_requested)
         {
             break;
@@ -954,14 +970,6 @@ int main()
         server_fd = -1;
     }
 
-    // --------------------------------------------------
-    // Workers finish their current client and exit.
-    //
-    // Workers blocked in read() can remain blocked until
-    // SO_RCVTIMEO expires. This is a known V1 limitation.
-    // V2 can improve shutdown latency separately.
-    // --------------------------------------------------
-
     std::cout
         << "[Server] Awaiting thread pool convergence...\n";
 
@@ -972,10 +980,6 @@ int main()
             worker.join();
         }
     }
-
-    // ==================================================
-    // DRAIN QUEUED SOCKETS
-    // ==================================================
 
     {
         std::lock_guard<std::mutex> lock(
